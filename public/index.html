@@ -80,7 +80,7 @@ table.lb .me { color: var(--primary); font-weight:600; }
       <b>玩法</b><br>
       1. 每人输入一个初始词，全部提交后展示给所有人<br>
       2. 倒计时内每人联想一个新词提交，<b>全员提交后立即公示</b><br>
-      3. 展示所有人的词，重复联想，直到所有人想到完全相同的词<br>
+      3. 公示后所有人点「确认」进入下一轮，重复联想，直到所有人想到完全相同的词<br>
       4. 倒计时结束仍无人提交，游戏自动结束<br><br>
       <b>积分</b>（仅本局有效，每局从 0 开始，不保留历史）<br>
       每轮与至少一名其他人同词 +10；全员同词相遇成功 +50；速度奖励第1轮 +90、第2轮 +80……第10轮起 0
@@ -144,7 +144,8 @@ table.lb .me { color: var(--primary); font-weight:600; }
       <div id="revealTitle" class="banner"></div>
       <div id="revealWords" class="reveal-grid"></div>
       <div id="scoreBreakdown" class="breakdown hidden"></div>
-      <p id="revealNext" class="hint"></p>
+      <p id="revealConfirmInfo" class="hint"></p>
+      <button id="revealConfirmBtn" class="primary hidden">确认，开始下一轮</button>
       <button id="rematchBtn" class="primary hidden">再来一局</button>
     </div>
 
@@ -315,12 +316,13 @@ function render(s) {
 
   renderPlayers(s, me);
   for (const ph of ['lobby', 'initial', 'round', 'reveal']) {
-    $('phase' + ph[0].toUpperCase() + ph.slice(1)).classList.toggle('hidden', s.phase !== ph);
+    const show = ph === 'reveal' ? (s.phase === 'reveal' || s.phase === 'ended') : s.phase === ph;
+    $('phase' + ph[0].toUpperCase() + ph.slice(1)).classList.toggle('hidden', !show);
   }
   if (s.phase === 'lobby') renderLobby(s, me);
   if (s.phase === 'initial') renderInitial(s, me);
   if (s.phase === 'round') renderRound(s, me);
-  if (s.phase === 'reveal' || s.phase === 'ended') renderReveal(s);
+  if (s.phase === 'reveal' || s.phase === 'ended') renderReveal(s, me);
   renderSessionScores(s, me);
 
   if (phaseChanged && (s.phase === 'reveal' || s.phase === 'ended')) {
@@ -354,6 +356,7 @@ function renderPlayers(s, me) {
 
 function playerTag(s, p) {
   if (!p.alive) return '已离开';
+  if (s.phase === 'reveal' && p.confirmed) return '已确认';
   if (s.phase === 'round' && !p.inRound) return '观战';
   if (p.submitted) return '已提交';
   if (s.phase === 'lobby') return '已就位';
@@ -405,7 +408,7 @@ function renderRound(s, me) {
   $('roundSpectatorBox').classList.toggle('hidden', inRound);
 }
 
-function renderReveal(s) {
+function renderReveal(s, me) {
   if (s.ended && s.endReason === 'nobody') {
     $('revealTitle').textContent = '无人提交，游戏结束';
     $('revealTitle').style.color = 'var(--danger)';
@@ -457,6 +460,21 @@ function renderReveal(s) {
   } else {
     bd.classList.add('hidden');
   }
+  if (!s.ended) {
+    // 公示阶段：全员确认后进入下一轮
+    const alive = s.players.filter((p) => p.alive).length;
+    const btn = $('revealConfirmBtn');
+    if (me && me.confirmed) {
+      btn.classList.add('hidden');
+      $('revealConfirmInfo').textContent = '已确认 ' + s.confirmedCount + '/' + alive + '，等待其他人…';
+    } else {
+      btn.classList.remove('hidden');
+      $('revealConfirmInfo').textContent = '已确认 ' + s.confirmedCount + '/' + alive;
+    }
+  } else {
+    $('revealConfirmBtn').classList.add('hidden');
+    $('revealConfirmInfo').textContent = '';
+  }
   $('rematchBtn').classList.toggle('hidden', !s.ended);
 }
 
@@ -486,11 +504,6 @@ function updateCountdown() {
     const remain = Math.max(0, state.deadline - Date.now());
     el.textContent = Math.ceil(remain / 1000);
     el.classList.toggle('warn', remain > 0 && remain <= 10000);
-  } else if (state.phase === 'reveal' && !state.ended && state.nextRoundAt) {
-    const remain = Math.max(0, state.nextRoundAt - Date.now());
-    $('revealNext').textContent = Math.ceil(remain / 1000) + ' 秒后自动开始第 ' + (state.round + 1) + ' 轮';
-  } else {
-    $('revealNext').textContent = '';
   }
 }
 setInterval(updateCountdown, 200);
@@ -561,6 +574,7 @@ $('roundSubmitBtn').addEventListener('click', () => {
 });
 $('roundWordInput').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('roundSubmitBtn').click(); });
 $('roundUnsubmitBtn').addEventListener('click', () => send({ type: 'unsubmit' }));
+$('revealConfirmBtn').addEventListener('click', () => send({ type: 'confirm' }));
 $('rematchBtn').addEventListener('click', () => send({ type: 'rematch' }));
 $('leaveBtn').addEventListener('click', () => {
   manualLeave = true;

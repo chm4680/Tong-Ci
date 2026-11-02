@@ -9,7 +9,6 @@ const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
 
 const PORT = process.env.PORT || 3000;
-const REVEAL_MS = Number(process.env.REVEAL_MS) || 8000; // 展示结果后自动进入下一轮的等待时间
 
 const rooms = new Map();        // code -> room
 
@@ -34,7 +33,6 @@ function createRoom() {
     tFirst: 60,
     tNext: 60,
     deadline: 0,
-    nextRoundAt: 0,
     submissions: {},     // playerId -> word
     initialWords: null,
     lastWords: null,
@@ -54,6 +52,7 @@ function roomState(room) {
     matched: p.matched,
     inRound: p.inRound,
     submitted: p.id in room.submissions,
+    confirmed: p.confirmed,
   }));
   return {
     code: room.code,
@@ -61,11 +60,11 @@ function roomState(room) {
     phase: room.phase,
     round: room.round,
     deadline: room.deadline,
-    nextRoundAt: room.nextRoundAt,
     tFirst: room.tFirst,
     tNext: room.tNext,
     players,
     submittedCount: players.filter((p) => p.submitted && p.alive).length,
+    confirmedCount: players.filter((p) => p.confirmed && p.alive).length,
     initialWords: room.initialWords,
     lastWords: room.lastWords,
     ended: room.phase === 'ended',
@@ -98,7 +97,6 @@ function startRound(room) {
   clearTimer(room);
   room.phase = 'round';
   room.submissions = {};
-  room.nextRoundAt = 0;
   const secs = room.round === 1 ? room.tFirst : room.tNext;
   room.deadline = Date.now() + secs * 1000;
   for (const p of alivePlayers(room)) p.inRound = true;
@@ -151,13 +149,19 @@ function endRound(room) {
       name: p.name, match: p.matched * 10, win: 0, speed: 0, total: p.score, word: null,
     }));
   } else {
-    room.nextRoundAt = Date.now() + REVEAL_MS;
-    room.timer = setTimeout(() => {
-      room.round += 1;
-      startRound(room);
-    }, REVEAL_MS);
+    // 公示阶段：等所有存活玩家确认后再进入下一轮
+    for (const q of alivePlayers(room)) q.confirmed = false;
   }
   pushState(room);
+}
+
+function checkAllConfirm(room) {
+  if (room.phase !== 'reveal') return;
+  const alive = alivePlayers(room);
+  if (alive.length > 0 && alive.every((q) => q.confirmed)) {
+    room.round += 1;
+    startRound(room);
+  }
 }
 
 function checkAllInitialSubmitted(room) {
@@ -175,11 +179,11 @@ function rematch(room) {
   for (const p of room.players.values()) {
     p.score = 0;
     p.matched = 0;
+    p.confirmed = false;
   }
   room.phase = 'initial';
   room.round = 0;
   room.deadline = 0;
-  room.nextRoundAt = 0;
   room.submissions = {};
   room.initialWords = null;
   room.lastWords = null;
@@ -203,7 +207,11 @@ function detach(ws) {
       if (p.ws === ws && p.alive) {
         p.alive = false;
         p.inRound = false;
-        if (room.phase === 'initial') checkAllInitialSubmitted(room);
+        if (room.phase === 'initial') {
+          checkAllInitialSubmitted(room);
+        } else if (room.phase === 'reveal') {
+          checkAllConfirm(room);
+        }
         pushState(room);
         return;
       }
@@ -227,7 +235,7 @@ wss.on('connection', (ws) => {
       detach(ws);
       const room = createRoom();
       rooms.set(room.code, room);
-      const player = { id: genId(), name, ws, alive: true, score: 0, matched: 0, inRound: false, room };
+      const player = { id: genId(), name, ws, alive: true, score: 0, matched: 0, inRound: false, confirmed: false, room };
       room.players.set(player.id, player);
       room.host = player.id;
       send(ws, { type: 'joined', code: room.code, playerId: player.id });
@@ -255,7 +263,7 @@ wss.on('connection', (ws) => {
         pushState(room);
         return;
       }
-      const player = { id: genId(), name, ws, alive: true, score: 0, matched: 0, inRound: false, room };
+      const player = { id: genId(), name, ws, alive: true, score: 0, matched: 0, inRound: false, confirmed: false, room };
       room.players.set(player.id, player);
       send(ws, { type: 'joined', code: room.code, playerId: player.id });
       pushState(room);
@@ -281,6 +289,7 @@ wss.on('connection', (ws) => {
       for (const q of room.players.values()) {
         q.score = 0;
         q.matched = 0;
+        q.confirmed = false;
       }
       pushState(room);
       return;
@@ -320,6 +329,14 @@ wss.on('connection', (ws) => {
       if (room.phase !== 'round' || !(p.id in room.submissions)) return;
       delete room.submissions[p.id];
       pushState(room);
+      return;
+    }
+
+    if (msg.type === 'confirm') {
+      if (room.phase !== 'reveal' || p.confirmed) return;
+      p.confirmed = true;
+      pushState(room);
+      checkAllConfirm(room);
       return;
     }
 
