@@ -12,7 +12,6 @@ const PORT = process.env.PORT || 3000;
 const REVEAL_MS = Number(process.env.REVEAL_MS) || 8000; // 展示结果后自动进入下一轮的等待时间
 
 const rooms = new Map();        // code -> room
-const leaderboard = new Map();  // name -> 累计积分（存在服务器内存中，重启清零）
 
 const norm = (w) => String(w || '').trim().toLowerCase();
 const genId = () => Math.random().toString(36).slice(2, 10);
@@ -39,14 +38,11 @@ function createRoom() {
     submissions: {},     // playerId -> word
     initialWords: null,
     lastWords: null,
-    lastScoreDelta: null,
+    lastScores: null,
+    endReason: null,     // win | nobody | null
     history: [],
     timer: null,
   };
-}
-
-function addScore(name, delta) {
-  leaderboard.set(name, (leaderboard.get(name) || 0) + delta);
 }
 
 function roomState(room) {
@@ -55,6 +51,7 @@ function roomState(room) {
     name: p.name,
     alive: p.alive,
     score: p.score,
+    matched: p.matched,
     inRound: p.inRound,
     submitted: p.id in room.submissions,
   }));
@@ -72,12 +69,9 @@ function roomState(room) {
     initialWords: room.initialWords,
     lastWords: room.lastWords,
     ended: room.phase === 'ended',
+    endReason: room.endReason,
     history: room.history,
-    scoreDelta: room.lastScoreDelta,
-    leaderboard: [...leaderboard.entries()]
-      .map(([name, score]) => ({ name, score }))
-      .sort((a, b) => b.score - a.score)
-      .slice(0, 20),
+    lastScores: room.lastScores,
   };
 }
 
@@ -120,6 +114,20 @@ function endRound(room) {
   room.lastWords = words;
   room.history.push({ round: room.round, words });
   const submitted = words.filter((w) => w.word);
+
+  // 本轮同步奖励：与至少一名其他人的词相同，+10；词与众不同的不得分
+  if (submitted.length >= 2) {
+    const counts = new Map();
+    for (const w of submitted) counts.set(norm(w.word), (counts.get(norm(w.word)) || 0) + 1);
+    for (const p of roundPlayers) {
+      const w = room.submissions[p.id];
+      if (w && counts.get(norm(w)) >= 2) {
+        p.score += 10;
+        p.matched += 1;
+      }
+    }
+  }
+
   const converged =
     words.length >= 2 &&
     submitted.length === words.length &&
@@ -127,15 +135,21 @@ function endRound(room) {
 
   if (converged) {
     room.phase = 'ended';
+    room.endReason = 'win';
     const r = room.round;
-    const perRound = 10 * r;
     const win = 50;
     const speed = Math.max(0, 10 - r) * 10;
-    room.lastScoreDelta = { perRound, win, speed, total: perRound + win + speed, word: submitted[0].word };
-    for (const p of roundPlayers) {
-      p.score += room.lastScoreDelta.total;
-      addScore(p.name, room.lastScoreDelta.total);
-    }
+    for (const p of roundPlayers) p.score += win + speed;
+    room.lastScores = roundPlayers.map((p) => ({
+      name: p.name, match: p.matched * 10, win, speed, total: p.score, word: submitted[0].word,
+    }));
+  } else if (submitted.length === 0) {
+    // 无人提交：游戏自动结束
+    room.phase = 'ended';
+    room.endReason = 'nobody';
+    room.lastScores = roundPlayers.map((p) => ({
+      name: p.name, match: p.matched * 10, win: 0, speed: 0, total: p.score, word: null,
+    }));
   } else {
     room.nextRoundAt = Date.now() + REVEAL_MS;
     room.timer = setTimeout(() => {
@@ -158,6 +172,10 @@ function checkAllInitialSubmitted(room) {
 function rematch(room) {
   clearTimer(room);
   for (const [id, p] of [...room.players]) if (!p.alive) room.players.delete(id);
+  for (const p of room.players.values()) {
+    p.score = 0;
+    p.matched = 0;
+  }
   room.phase = 'initial';
   room.round = 0;
   room.deadline = 0;
@@ -165,7 +183,8 @@ function rematch(room) {
   room.submissions = {};
   room.initialWords = null;
   room.lastWords = null;
-  room.lastScoreDelta = null;
+  room.lastScores = null;
+  room.endReason = null;
   room.history = [];
   pushState(room);
 }
@@ -208,7 +227,7 @@ wss.on('connection', (ws) => {
       detach(ws);
       const room = createRoom();
       rooms.set(room.code, room);
-      const player = { id: genId(), name, ws, alive: true, score: 0, inRound: false, room };
+      const player = { id: genId(), name, ws, alive: true, score: 0, matched: 0, inRound: false, room };
       room.players.set(player.id, player);
       room.host = player.id;
       send(ws, { type: 'joined', code: room.code, playerId: player.id });
@@ -236,7 +255,7 @@ wss.on('connection', (ws) => {
         pushState(room);
         return;
       }
-      const player = { id: genId(), name, ws, alive: true, score: 0, inRound: false, room };
+      const player = { id: genId(), name, ws, alive: true, score: 0, matched: 0, inRound: false, room };
       room.players.set(player.id, player);
       send(ws, { type: 'joined', code: room.code, playerId: player.id });
       pushState(room);
@@ -256,8 +275,13 @@ wss.on('connection', (ws) => {
       room.submissions = {};
       room.initialWords = null;
       room.lastWords = null;
-      room.lastScoreDelta = null;
+      room.lastScores = null;
+      room.endReason = null;
       room.history = [];
+      for (const q of room.players.values()) {
+        q.score = 0;
+        q.matched = 0;
+      }
       pushState(room);
       return;
     }
@@ -271,16 +295,31 @@ wss.on('connection', (ws) => {
     }
 
     if (msg.type === 'submit') {
-      if (room.phase === 'round' && !p.inRound) {
-        return send(ws, { type: 'error', message: '本轮你未参与，下一轮再提交' });
-      }
       if (room.phase !== 'initial' && room.phase !== 'round') return;
+      if (room.phase === 'round') {
+        if (!p.inRound) return send(ws, { type: 'error', message: '本轮你未参与，下一轮再提交' });
+        if (p.id in room.submissions) return send(ws, { type: 'error', message: '本轮已提交，等待其他玩家' });
+      }
       const word = String(msg.word || '').trim().slice(0, 50);
       if (!word) return;
       if (room.phase === 'initial' && p.id in room.submissions) return; // 初始词提交后不可改
       room.submissions[p.id] = word;
+      if (room.phase === 'initial') {
+        pushState(room);
+        checkAllInitialSubmitted(room);
+        return;
+      }
+      // 全员提交后立即公示
+      const allIn = alivePlayers(room).filter((q) => q.inRound).every((q) => q.id in room.submissions);
+      if (allIn) endRound(room);
+      else pushState(room);
+      return;
+    }
+
+    if (msg.type === 'unsubmit') {
+      if (room.phase !== 'round' || !(p.id in room.submissions)) return;
+      delete room.submissions[p.id];
       pushState(room);
-      if (room.phase === 'initial') checkAllInitialSubmitted(room);
       return;
     }
 

@@ -40,6 +40,7 @@ button:disabled { opacity:.5; }
 .countdown.warn { color: var(--danger); }
 .round-label { text-align:center; color:var(--muted); }
 .hint { color:var(--muted); font-size:14px; text-align:center; margin:8px 0; }
+.egg { font-size:12px; color:#9aa1b3; font-style:italic; text-align:center; margin-top:9px; line-height:1.6; }
 .refwords { background:#f2f4fb; border-radius:10px; padding:10px 12px; margin-bottom:12px; font-size:15px; line-height:1.8; }
 .refwords .t { color:var(--muted); font-size:13px; display:block; }
 .refwords b { color: var(--primary); }
@@ -60,6 +61,9 @@ table.lb .me { color: var(--primary); font-weight:600; }
 <body>
 <div id="app">
 
+  <div id="connBanner" class="hidden"></div>
+  <div id="eggConnect" class="egg hidden"></div>
+
   <section id="home">
     <h1>同词相遇</h1>
     <p class="sub">和朋友们一起联想，直到所有人想到同一个词</p>
@@ -75,11 +79,11 @@ table.lb .me { color: var(--primary); font-weight:600; }
     <div class="card rules">
       <b>玩法</b><br>
       1. 每人输入一个初始词，全部提交后展示给所有人<br>
-      2. 倒计时内，每人根据上一轮展示的所有词，联想一个新词（本轮内可修改）<br>
-      3. 倒计时结束，展示所有人的词<br>
-      4. 重复联想，直到<b>所有人想到完全相同的词</b>，游戏结束<br><br>
-      <b>积分</b><br>
-      每完成一轮 +10 分；相遇成功 +50 分；越早相遇速度奖励越高（第1轮 +90，第2轮 +80……第10轮起 0）
+      2. 倒计时内每人联想一个新词提交，<b>全员提交后立即公示</b><br>
+      3. 展示所有人的词，重复联想，直到所有人想到完全相同的词<br>
+      4. 倒计时结束仍无人提交，游戏自动结束<br><br>
+      <b>积分</b>（仅本局有效，每局从 0 开始，不保留历史）<br>
+      每轮与至少一名其他人同词 +10；全员同词相遇成功 +50；速度奖励第1轮 +90、第2轮 +80……第10轮起 0
     </div>
   </section>
 
@@ -88,7 +92,6 @@ table.lb .me { color: var(--primary); font-weight:600; }
       <span class="label">房间码</span>
       <span><span id="codeLabel"></span><button id="copyBtn">复制</button></span>
     </div>
-    <div id="connBanner" class="hidden">连接断开，正在重连…</div>
     <div id="playerList" class="players"></div>
 
     <div id="phaseLobby" class="card hidden">
@@ -101,6 +104,7 @@ table.lb .me { color: var(--primary); font-weight:600; }
         <input id="tNext" type="number" min="5" max="600" value="60">
       </div>
       <button id="startBtn" class="primary hidden">开始游戏</button>
+      <div id="eggLobby" class="egg hidden"></div>
     </div>
 
     <div id="phaseInitial" class="card hidden">
@@ -112,6 +116,7 @@ table.lb .me { color: var(--primary); font-weight:600; }
       </div>
       <div id="initialDoneBox" class="hidden">
         <p class="hint">已提交，等待其他人…</p>
+        <div id="eggInitial" class="egg hidden"></div>
       </div>
       <button id="forceStartBtn" class="small hidden">跳过等待，直接开始</button>
     </div>
@@ -124,10 +129,15 @@ table.lb .me { color: var(--primary); font-weight:600; }
         <input id="roundWordInput" maxlength="50" placeholder="输入你联想到的词">
         <button id="roundSubmitBtn" class="primary">提交</button>
       </div>
+      <div id="roundDoneBox" class="hidden">
+        <p class="hint">已提交，等待其他人…（全员提交后立即公示）</p>
+        <button id="roundUnsubmitBtn" class="small">撤回修改</button>
+        <div id="eggRoundDone" class="egg hidden"></div>
+      </div>
       <div id="roundSpectatorBox" class="hidden">
         <p class="hint">你中途加入，本轮观战，下一轮开始参与</p>
+        <div id="eggRoundSpec" class="egg hidden"></div>
       </div>
-      <p id="roundSubmitState" class="hint"></p>
     </div>
 
     <div id="phaseReveal" class="card hidden">
@@ -139,8 +149,8 @@ table.lb .me { color: var(--primary); font-weight:600; }
     </div>
 
     <div class="card">
-      <h3>积分榜</h3>
-      <table class="lb"><tbody id="leaderboard"></tbody></table>
+      <h3>本局积分</h3>
+      <table class="lb"><tbody id="sessionScores"></tbody></table>
     </div>
 
     <button id="leaveBtn" class="small">退出房间</button>
@@ -153,12 +163,65 @@ table.lb .me { color: var(--primary); font-weight:600; }
 const $ = (id) => document.getElementById(id);
 let ws = null, state = null, myName = '', myCode = '', myPlayerId = null;
 let manualLeave = false, autoRejoining = false, reconnectTimer = null, toastTimer = null, lastPhase = null;
+let everConnected = false, connTimer = null, connAttempt = 0;
+
+// 文字彩蛋：仅在等候/加载场景显示，每个等待期固定一条
+const EGGS = [
+  '你应该放弃世间的一切垃圾，来游玩我们伟大的游戏大逆转裁判。',
+  '这个网站的一切都要感谢大肥鱼——它的鱼脑和鱼翅。',
+  '也许……嗯……这也是计划中的一部分。',
+  '如果你也开始像我一样攒塑料袋，说明你老了。',
+  '如果你能帮作者写实验报告，对方将会非常感谢你。',
+  '你应该尝试游玩幽灵诡计，它是很伟大的作品',
+  '这个网站的出现可以感谢很多人和事，但绝对不包括11月2日的高等物化实验。',
+  '哈基米，曼波~',
+  '嗯……这是对的吗？',
+  'err……也许是的？',
+];
+let eggIdx = -1, eggCtx = null;
+function pickEgg(ctx) {
+  if (ctx === eggCtx) return;
+  let i;
+  do { i = Math.floor(Math.random() * EGGS.length); } while (EGGS.length > 1 && i === eggIdx);
+  eggIdx = i;
+  eggCtx = ctx;
+}
+function setEgg(elId, show) {
+  const el = $(elId);
+  if (show) {
+    el.textContent = '作者说：“' + EGGS[eggIdx] + '”';
+    el.classList.remove('hidden');
+  } else {
+    el.classList.add('hidden');
+  }
+}
+function eggContext(s, me) {
+  if (!me) return null;
+  if (s.phase === 'lobby') return 'lobby';
+  if (s.phase === 'initial' && me.submitted) return 'initial';
+  if (s.phase === 'round' && me.submitted && me.inRound) return 'round' + s.round;
+  if (s.phase === 'round' && !me.inRound) return 'spec' + s.round;
+  return null;
+}
+function showConnBanner() {
+  connAttempt++;
+  pickEgg('conn' + connAttempt);
+  const b = $('connBanner');
+  b.textContent = everConnected ? '连接断开，正在重连…' : '正在连接…';
+  b.classList.remove('hidden');
+  setEgg('eggConnect', true);
+}
+function hideConnBanner() {
+  $('connBanner').classList.add('hidden');
+  setEgg('eggConnect', false);
+}
 
 function connect() {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
   ws = new WebSocket(proto + '://' + location.host);
   ws.onopen = () => {
-    $('connBanner').classList.add('hidden');
+    everConnected = true;
+    hideConnBanner();
     if (myCode && myName) {
       autoRejoining = true;
       send({ type: 'join', code: myCode, name: myName });
@@ -200,11 +263,15 @@ function connect() {
   };
   ws.onclose = () => {
     if (myCode && !manualLeave) {
-      $('connBanner').classList.remove('hidden');
+      showConnBanner();
       clearTimeout(reconnectTimer);
       reconnectTimer = setTimeout(connect, 2000);
     }
   };
+  if (!everConnected) {
+    clearTimeout(connTimer);
+    connTimer = setTimeout(() => { if (ws.readyState !== 1) showConnBanner(); }, 800);
+  }
 }
 function send(obj) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj)); }
 
@@ -222,12 +289,29 @@ function showHome() {
 }
 
 function render(s) {
-  const phaseChanged = !state || state.phase !== s.phase;
+  const prev = state;
+  const phaseChanged = !prev || prev.phase !== s.phase;
   state = s;
   $('home').classList.add('hidden');
   $('room').classList.remove('hidden');
   $('codeLabel').textContent = s.code;
   const me = s.players.find((p) => p.id === myPlayerId) || null;
+
+  // 每轮开始或回到初始词阶段时清空输入框
+  if (s.phase === 'round' && (!prev || prev.phase !== 'round' || prev.round !== s.round)) {
+    $('roundWordInput').value = '';
+  }
+  if (s.phase === 'initial' && (!prev || prev.phase !== 'initial')) {
+    $('initialWordInput').value = '';
+  }
+
+  // 彩蛋：仅在等候场景显示，等待期不变则内容不变
+  const eggC = eggContext(s, me);
+  if (eggC) pickEgg(eggC);
+  setEgg('eggLobby', s.phase === 'lobby');
+  setEgg('eggInitial', s.phase === 'initial' && !!me && me.submitted);
+  setEgg('eggRoundDone', s.phase === 'round' && !!me && me.submitted && me.inRound);
+  setEgg('eggRoundSpec', s.phase === 'round' && !!me && !me.inRound);
 
   renderPlayers(s, me);
   for (const ph of ['lobby', 'initial', 'round', 'reveal']) {
@@ -237,7 +321,7 @@ function render(s) {
   if (s.phase === 'initial') renderInitial(s, me);
   if (s.phase === 'round') renderRound(s, me);
   if (s.phase === 'reveal' || s.phase === 'ended') renderReveal(s);
-  renderLeaderboard(s);
+  renderSessionScores(s, me);
 
   if (phaseChanged && (s.phase === 'reveal' || s.phase === 'ended')) {
     beep();
@@ -316,14 +400,19 @@ function renderRound(s, me) {
   }
   if (!me) return;
   const inRound = me.inRound;
-  $('roundInputBox').classList.toggle('hidden', !inRound);
+  $('roundInputBox').classList.toggle('hidden', !inRound || me.submitted);
+  $('roundDoneBox').classList.toggle('hidden', !inRound || !me.submitted);
   $('roundSpectatorBox').classList.toggle('hidden', inRound);
-  $('roundSubmitState').textContent = inRound && me.submitted ? '已提交，倒计时结束前可修改' : '';
-  $('roundSubmitBtn').textContent = me.submitted ? '修改' : '提交';
 }
 
 function renderReveal(s) {
-  $('revealTitle').textContent = s.ended ? '相遇成功！' : '第 ' + s.round + ' 轮结果';
+  if (s.ended && s.endReason === 'nobody') {
+    $('revealTitle').textContent = '无人提交，游戏结束';
+    $('revealTitle').style.color = 'var(--danger)';
+  } else {
+    $('revealTitle').textContent = s.ended ? '相遇成功！' : '第 ' + s.round + ' 轮结果';
+    $('revealTitle').style.color = 'var(--ok)';
+  }
   const grid = $('revealWords');
   grid.textContent = '';
   for (const w of s.lastWords || []) {
@@ -340,24 +429,27 @@ function renderReveal(s) {
     grid.appendChild(c);
   }
   const bd = $('scoreBreakdown');
-  if (s.ended && s.scoreDelta) {
+  if (s.ended && s.lastScores) {
     bd.classList.remove('hidden');
     bd.textContent = '';
-    const d = s.scoreDelta;
-    const rows = [
-      ['共同之词', '「' + d.word + '」'],
-      ['完成 ' + s.round + ' 轮', '+' + d.perRound],
-      ['相遇成功', '+' + d.win],
-      ['速度奖励', '+' + d.speed],
-      ['本局合计', '+' + d.total],
-    ];
-    for (const [k, v] of rows) {
+    if (s.endReason === 'win' && s.lastScores[0]) {
       const row = document.createElement('div');
       row.className = 'row';
       const a = document.createElement('span');
-      a.textContent = k;
+      a.textContent = '共同之词';
       const b = document.createElement('span');
-      b.textContent = v;
+      b.textContent = '「' + s.lastScores[0].word + '」';
+      row.appendChild(a);
+      row.appendChild(b);
+      bd.appendChild(row);
+    }
+    for (const e of s.lastScores) {
+      const row = document.createElement('div');
+      row.className = 'row';
+      const a = document.createElement('span');
+      a.textContent = e.name + '（同步 +' + e.match + ' 胜利 +' + e.win + ' 速度 +' + e.speed + '）';
+      const b = document.createElement('span');
+      b.textContent = '+' + e.total;
       row.appendChild(a);
       row.appendChild(b);
       bd.appendChild(row);
@@ -368,18 +460,19 @@ function renderReveal(s) {
   $('rematchBtn').classList.toggle('hidden', !s.ended);
 }
 
-function renderLeaderboard(s) {
-  const tb = $('leaderboard');
+function renderSessionScores(s, me) {
+  const tb = $('sessionScores');
   tb.textContent = '';
-  s.leaderboard.forEach((e, i) => {
+  const sorted = [...s.players].sort((a, b) => b.score - a.score);
+  sorted.forEach((p, i) => {
     const tr = document.createElement('tr');
     const td1 = document.createElement('td');
-    td1.textContent = (i + 1) + '. ' + e.name;
-    if (e.name === myName) td1.className = 'me';
+    td1.textContent = (i + 1) + '. ' + p.name;
+    if (me && p.id === me.id) td1.className = 'me';
     const td2 = document.createElement('td');
     td2.style.textAlign = 'right';
-    td2.textContent = e.score + ' 分';
-    if (e.name === myName) td2.className = 'me';
+    td2.textContent = p.score + ' 分';
+    if (me && p.id === me.id) td2.className = 'me';
     tr.appendChild(td1);
     tr.appendChild(td2);
     tb.appendChild(tr);
@@ -456,6 +549,7 @@ $('initialSubmitBtn').addEventListener('click', () => {
   const w = $('initialWordInput').value.trim();
   if (!w) return toast('请先输入一个词');
   send({ type: 'submit', word: w });
+  $('initialWordInput').value = '';
 });
 $('initialWordInput').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('initialSubmitBtn').click(); });
 $('forceStartBtn').addEventListener('click', () => send({ type: 'forceStart' }));
@@ -463,15 +557,19 @@ $('roundSubmitBtn').addEventListener('click', () => {
   const w = $('roundWordInput').value.trim();
   if (!w) return toast('请先输入一个词');
   send({ type: 'submit', word: w });
+  $('roundWordInput').value = '';
 });
 $('roundWordInput').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('roundSubmitBtn').click(); });
+$('roundUnsubmitBtn').addEventListener('click', () => send({ type: 'unsubmit' }));
 $('rematchBtn').addEventListener('click', () => send({ type: 'rematch' }));
 $('leaveBtn').addEventListener('click', () => {
   manualLeave = true;
   myCode = '';
   localStorage.removeItem('tc_code');
-  ws.close();
+  try { ws.close(); } catch (e) {}
   showHome();
+  manualLeave = false;
+  connect();
 });
 
 // 初始化：恢复昵称和房间，尝试自动重连
