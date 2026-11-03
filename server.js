@@ -56,6 +56,7 @@ function roomState(room) {
     confirmed: p.confirmed,
     confirmedSubmit: p.confirmedSubmit,
     votedEnd: p.votedEnd,
+    passed: room.phase === 'round' && room.submissions[p.id] === '',
   }));
   return {
     code: room.code,
@@ -110,6 +111,7 @@ function startRound(room) {
     p.confirmedSubmit = false;
     p.confirmedAt = null;
     p.votedEnd = false;
+    p.wasInRound = false;
   }
   for (const p of alivePlayers(room)) p.inRound = true;
   room.timer = setTimeout(() => endRound(room), secs * 1000);
@@ -132,13 +134,15 @@ function endRound(room) {
   for (const p of roundPlayers) {
     if (!p.confirmedSubmit) p.confirmedAt = room.deadline;
   }
-  const words = roundPlayers.map((p) => ({ name: p.name, word: room.submissions[p.id] || null }));
+  const words = roundPlayers.map((p) => ({ name: p.name, word: room.submissions[p.id] || null, passed: room.submissions[p.id] === '' }));
   room.lastWords = words;
   room.history.push({ round: room.round, words });
-  const submitted = words.filter((w) => w.word);
+  // 弃权者没有词，不参与相遇判定，也不影响其他人相遇
+  const contenders = roundPlayers.filter((p) => room.submissions[p.id]);
+  const submitted = contenders.map((p) => room.submissions[p.id]);
 
   const counts = new Map();
-  for (const w of submitted) counts.set(norm(w.word), (counts.get(norm(w.word)) || 0) + 1);
+  for (const w of submitted) counts.set(norm(w), (counts.get(norm(w)) || 0) + 1);
   const speedOf = (p) => speedScore((p.confirmedAt - room.roundStartAt) / 1000, T);
 
   // 同步奖励：与至少一名其他人词相同的玩家，按提交速度得分（最快 20，压线保底 10）
@@ -151,15 +155,18 @@ function endRound(room) {
   }
 
   const converged =
-    words.length >= 2 &&
-    submitted.length === words.length &&
-    submitted.every((w) => norm(w.word) === norm(submitted[0].word));
+    contenders.length >= 2 &&
+    submitted.length === contenders.length &&
+    submitted.every((w) => norm(w) === norm(submitted[0]));
 
   if (converged) {
     room.phase = 'ended';
     room.endReason = 'win';
     room.lastScores = roundPlayers.map((p) => ({
-      name: p.name, speed: speedOf(p), total: p.score, word: submitted[0].word,
+      name: p.name,
+      speed: room.submissions[p.id] === '' ? 0 : speedOf(p),
+      total: p.score,
+      word: submitted[0],
     }));
   } else if (submitted.length === 0) {
     // 无人提交：游戏自动结束
@@ -221,6 +228,7 @@ function rematch(room) {
     p.confirmedSubmit = false;
     p.confirmedAt = null;
     p.votedEnd = false;
+    p.wasInRound = false;
   }
   room.phase = 'initial';
   room.round = 0;
@@ -247,6 +255,7 @@ function restart(room) {
     p.confirmedSubmit = false;
     p.confirmedAt = null;
     p.votedEnd = false;
+    p.wasInRound = false;
   }
   room.phase = 'lobby';
   room.round = 0;
@@ -274,6 +283,7 @@ function detach(ws) {
     for (const p of room.players.values()) {
       if (p.ws === ws && p.alive) {
         p.alive = false;
+        p.wasInRound = p.inRound;
         p.inRound = false;
         if (room.phase === 'initial') {
           checkAllInitialSubmitted(room);
@@ -289,6 +299,8 @@ function detach(ws) {
 }
 
 wss.on('connection', (ws) => {
+  ws.isAlive = true;
+  ws.on('pong', () => { ws.isAlive = true; });
   ws.on('message', (raw) => {
     let msg;
     try {
@@ -304,7 +316,7 @@ wss.on('connection', (ws) => {
       detach(ws);
       const room = createRoom();
       rooms.set(room.code, room);
-      const player = { id: genId(), name, ws, alive: true, score: 0, matched: 0, inRound: false, confirmed: false, confirmedSubmit: false, confirmedAt: null, votedEnd: false, room };
+      const player = { id: genId(), name, ws, alive: true, score: 0, matched: 0, inRound: false, confirmed: false, confirmedSubmit: false, confirmedAt: null, votedEnd: false, wasInRound: false, room };
       room.players.set(player.id, player);
       room.host = player.id;
       send(ws, { type: 'joined', code: room.code, playerId: player.id });
@@ -328,6 +340,9 @@ wss.on('connection', (ws) => {
         }
         existing.ws = ws;
         existing.alive = true;
+        // 本轮中断线重连：恢复本轮参与资格，可继续游玩
+        if (room.phase === 'round' && existing.wasInRound) existing.inRound = true;
+        existing.wasInRound = false;
         send(ws, { type: 'joined', code: room.code, playerId: existing.id });
         if (room.phase === 'round' && existing.id in room.submissions) {
           send(ws, { type: 'myWord', word: room.submissions[existing.id] });
@@ -335,7 +350,7 @@ wss.on('connection', (ws) => {
         pushState(room);
         return;
       }
-      const player = { id: genId(), name, ws, alive: true, score: 0, matched: 0, inRound: false, confirmed: false, confirmedSubmit: false, confirmedAt: null, votedEnd: false, room };
+      const player = { id: genId(), name, ws, alive: true, score: 0, matched: 0, inRound: false, confirmed: false, confirmedSubmit: false, confirmedAt: null, votedEnd: false, wasInRound: false, room };
       room.players.set(player.id, player);
       send(ws, { type: 'joined', code: room.code, playerId: player.id });
       pushState(room);
@@ -382,9 +397,10 @@ wss.on('connection', (ws) => {
         if (p.id in room.submissions) return send(ws, { type: 'error', message: '本轮已提交' });
       }
       const word = String(msg.word || '').trim().slice(0, 50);
-      if (!word) return;
+      if (!word && room.phase !== 'round') return;
       if (room.phase === 'initial' && p.id in room.submissions) return; // 初始词提交后不可改
       room.submissions[p.id] = word;
+      if (room.phase === 'round' && !word) p.score -= 10; // 主动弃权扣分
       if (room.phase === 'initial') {
         pushState(room);
         checkAllInitialSubmitted(room);
@@ -408,6 +424,7 @@ wss.on('connection', (ws) => {
 
     if (msg.type === 'unsubmit') {
       if (room.phase !== 'round' || !(p.id in room.submissions) || p.confirmedSubmit) return;
+      if (room.submissions[p.id] === '') p.score += 10; // 撤回弃权，返还扣分
       delete room.submissions[p.id];
       pushState(room);
       return;
@@ -443,5 +460,17 @@ wss.on('connection', (ws) => {
 
   ws.on('close', () => detach(ws));
 });
+
+// 心跳：清掉已经死掉的连接，防止它们占着服务器资源
+setInterval(() => {
+  for (const ws of wss.clients) {
+    if (!ws.isAlive) {
+      ws.terminate();
+      continue;
+    }
+    ws.isAlive = false;
+    try { ws.ping(); } catch {}
+  }
+}, 30000);
 
 server.listen(PORT, () => console.log(`同词相遇已启动: http://localhost:${PORT}`));

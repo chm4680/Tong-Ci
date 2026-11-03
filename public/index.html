@@ -80,12 +80,14 @@ table.lb .me { color: var(--primary); font-weight:600; }
       <b>玩法</b><br>
       1. 每人输入一个初始词，全部提交后展示给所有人<br>
       2. 每轮倒计时内联想一个新词提交，可「撤回修改」，也可「确认提交」锁定答案<br>
-      3. 全员确认提交后立即公示；公示时同时展示上一轮的词<br>
-      4. 公示后所有人点「确认」进入下一轮，重复联想，直到所有人想到完全相同的词<br>
-      5. 公示时可以投票「认定全员同词，结束游戏」，全员同意即生效<br>
-      6. 倒计时 20–180 秒可选；倒计时结束仍无人提交，游戏自动结束；结束后展示本局总览<br><br>
+      3. 输入框留空时按钮变为「弃权（-10分）」，点它立即扣 10 分并可撤回（撤回返还）<br>
+      4. 全员确认提交后立即公示；公示时同时展示上一轮的词<br>
+      5. 公示后所有人点「确认」进入下一轮，重复联想，直到所有人想到完全相同的词<br>
+      6. 公示时可以投票「认定全员同词，结束游戏」，全员同意即生效<br>
+      7. 倒计时 20–180 秒可选；倒计时结束仍无人提交，游戏自动结束；结束后展示本局总览<br>
+      8. 中途断线重进不会变观战，本轮仍可继续游玩<br><br>
       <b>积分</b>（仅本局有效，每局从 0 开始，不保留历史）<br>
-      与至少一名其他人同词才能得分：前 20 秒内确认提交 +20，之后随时间减少，压线自动提交保底 +10；投票认定相遇每人 +20
+      与至少一名其他人同词才能得分：前 20 秒内确认提交 +20，之后随时间减少，压线自动提交保底 +10；投票认定相遇每人 +20；主动弃权 -10（撤回返还）
     </div>
   </section>
 
@@ -176,7 +178,8 @@ const $ = (id) => document.getElementById(id);
 let ws = null, state = null, myName = '', myCode = '', myPlayerId = null;
 let manualLeave = false, autoRejoining = false, reconnectTimer = null, toastTimer = null, lastPhase = null;
 let everConnected = false, connTimer = null, connAttempt = 0;
-let myRoundWord = '';
+let myRoundWord = '', myRoundPassed = false;
+let currentWs = null, pendingAction = null;
 
 // 文字彩蛋：仅在等候/加载场景显示，每个等待期固定一条
 const EGGS = [
@@ -239,9 +242,17 @@ function hideConnBanner() {
 function connect() {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
   ws = new WebSocket(proto + '://' + location.host);
+  currentWs = ws;
   ws.onopen = () => {
     everConnected = true;
     hideConnBanner();
+    // 连接建立后先补发之前没发出去的操作（如点了加入但当时没连上）
+    if (pendingAction) {
+      const a = pendingAction;
+      pendingAction = null;
+      ws.send(JSON.stringify(a));
+      return;
+    }
     if (myCode && myName) {
       autoRejoining = true;
       send({ type: 'join', code: myCode, name: myName });
@@ -257,6 +268,7 @@ function connect() {
       localStorage.setItem('tc_code', msg.code);
     } else if (msg.type === 'myWord') {
       myRoundWord = msg.word;
+      myRoundPassed = msg.word === '';
     } else if (msg.type === 'state') {
       autoRejoining = false;
       render(msg.state);
@@ -270,7 +282,6 @@ function connect() {
         showHome();
         try { ws.close(); } catch (e) {}
         manualLeave = false;
-        connect();
       }
     } else if (msg.type === 'kicked') {
       manualLeave = true;
@@ -280,11 +291,12 @@ function connect() {
       showHome();
       try { ws.close(); } catch (e) {}
       manualLeave = false;
-      connect();
     }
   };
   ws.onclose = () => {
-    if (myCode && !manualLeave) {
+    if (manualLeave || ws !== currentWs) return;
+    // 只要还在房间（或有点击操作没发出去），就不断自动重连
+    if (myCode || pendingAction) {
       showConnBanner();
       clearTimeout(reconnectTimer);
       reconnectTimer = setTimeout(connect, 2000);
@@ -295,7 +307,21 @@ function connect() {
     connTimer = setTimeout(() => { if (ws.readyState !== 1) showConnBanner(); }, 800);
   }
 }
-function send(obj) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj)); }
+function send(obj) {
+  if (ws && ws.readyState === 1) {
+    ws.send(JSON.stringify(obj));
+    return;
+  }
+  if (obj.type === 'create' || obj.type === 'join') {
+    // 还没连上：先记下操作，连上后自动补发，并开始重连
+    pendingAction = obj;
+    showConnBanner();
+    if (!ws || ws.readyState === 3) {
+      clearTimeout(reconnectTimer);
+      connect();
+    }
+  }
+}
 
 function toast(text) {
   const t = $('toast');
@@ -322,7 +348,9 @@ function render(s) {
   // 每轮开始或回到初始词阶段时清空输入框
   if (s.phase === 'round' && (!prev || prev.phase !== 'round' || prev.round !== s.round)) {
     $('roundWordInput').value = '';
+    $('roundSubmitBtn').textContent = '弃权（-10分）';
     myRoundWord = '';
+    myRoundPassed = false;
   }
   if (s.phase === 'initial' && (!prev || prev.phase !== 'initial')) {
     $('initialWordInput').value = '';
@@ -382,6 +410,7 @@ function playerTag(s, p) {
   if (s.phase === 'reveal' && p.confirmed) return '已确认';
   if (s.phase === 'round' && !p.inRound) return '观战';
   if (s.phase === 'round' && p.submitted && p.confirmedSubmit) return '已锁定';
+  if (s.phase === 'round' && p.passed) return '已弃权';
   if (p.submitted) return '已提交';
   if (s.phase === 'lobby') return '已就位';
   return '思考中';
@@ -406,6 +435,9 @@ function renderInitial(s, me) {
   $('forceStartBtn').classList.toggle('hidden', !(me.id === s.hostId && s.submittedCount < alive && s.submittedCount > 0));
 }
 
+// 显示词条：正常词、弃权、未提交
+const wordText = (w) => w.word || (w.passed ? '弃权' : '未提交');
+
 function renderRound(s, me) {
   $('roundNo').textContent = s.round;
   const ref = s.round === 1 ? s.initialWords : s.lastWords;
@@ -419,7 +451,7 @@ function renderRound(s, me) {
     refBox.appendChild(t);
     for (const w of ref) {
       const b = document.createElement('b');
-      b.textContent = w.name + '「' + (w.word || '未提交') + '」 ';
+      b.textContent = w.name + '「' + wordText(w) + '」 ';
       refBox.appendChild(b);
     }
   } else {
@@ -431,7 +463,11 @@ function renderRound(s, me) {
   $('roundDoneBox').classList.toggle('hidden', !inRound || !me.submitted);
   $('roundSpectatorBox').classList.toggle('hidden', inRound);
   if (inRound && me.submitted) {
-    $('roundMyWord').textContent = myRoundWord ? '你提交的词：「' + myRoundWord + '」' : '你已提交';
+    if (myRoundPassed) {
+      $('roundMyWord').textContent = '你本轮弃权（-10分）';
+    } else {
+      $('roundMyWord').textContent = myRoundWord ? '你提交的词：「' + myRoundWord + '」' : '你已提交';
+    }
     const locked = me.confirmedSubmit;
     $('roundUnsubmitBtn').classList.toggle('hidden', locked);
     $('roundConfirmBtn').classList.toggle('hidden', locked);
@@ -466,7 +502,7 @@ function renderReveal(s, me) {
     refBox.appendChild(t);
     for (const w of prevWords) {
       const b = document.createElement('b');
-      b.textContent = w.name + '「' + (w.word || '未提交') + '」 ';
+      b.textContent = w.name + '「' + wordText(w) + '」 ';
       refBox.appendChild(b);
     }
   } else {
@@ -483,7 +519,7 @@ function renderReveal(s, me) {
     who.textContent = w.name;
     const word = document.createElement('div');
     word.className = 'w' + (w.word ? '' : ' miss');
-    word.textContent = w.word || '未提交';
+    word.textContent = wordText(w);
     c.appendChild(who);
     c.appendChild(word);
     grid.appendChild(c);
@@ -531,7 +567,7 @@ function renderReveal(s, me) {
     ov.appendChild(title);
     const addWords = (label, words) => {
       const d = document.createElement('div');
-      d.textContent = label + '　' + (words || []).map((w) => w.name + '「' + (w.word || '未提交') + '」').join('　');
+      d.textContent = label + '　' + (words || []).map((w) => w.name + '「' + wordText(w) + '」').join('　');
       ov.appendChild(d);
     };
     if (s.initialWords && s.initialWords.length) addWords('初始词：', s.initialWords);
@@ -658,14 +694,25 @@ $('initialWordInput').addEventListener('keydown', (e) => { if (e.key === 'Enter'
 $('forceStartBtn').addEventListener('click', () => send({ type: 'forceStart' }));
 $('roundSubmitBtn').addEventListener('click', () => {
   const w = $('roundWordInput').value.trim();
-  if (!w) return toast('请先输入一个词');
-  send({ type: 'submit', word: w });
-  myRoundWord = w;
+  if (!w) {
+    // 空答案 = 主动弃权，立即扣 10 分
+    send({ type: 'submit', word: '' });
+    myRoundWord = '';
+    myRoundPassed = true;
+  } else {
+    send({ type: 'submit', word: w });
+    myRoundWord = w;
+    myRoundPassed = false;
+  }
   $('roundWordInput').value = '';
+});
+$('roundWordInput').addEventListener('input', () => {
+  $('roundSubmitBtn').textContent = $('roundWordInput').value.trim() ? '提交' : '弃权（-10分）';
 });
 $('roundWordInput').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('roundSubmitBtn').click(); });
 $('roundUnsubmitBtn').addEventListener('click', () => {
   myRoundWord = '';
+  myRoundPassed = false;
   send({ type: 'unsubmit' });
 });
 $('roundConfirmBtn').addEventListener('click', () => send({ type: 'confirmSubmit' }));
