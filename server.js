@@ -33,6 +33,7 @@ function createRoom() {
     tFirst: 60,
     tNext: 60,
     deadline: 0,
+    roundStartAt: 0,
     submissions: {},     // playerId -> word
     initialWords: null,
     lastWords: null,
@@ -53,6 +54,8 @@ function roomState(room) {
     inRound: p.inRound,
     submitted: p.id in room.submissions,
     confirmed: p.confirmed,
+    confirmedSubmit: p.confirmedSubmit,
+    votedEnd: p.votedEnd,
   }));
   return {
     code: room.code,
@@ -65,6 +68,8 @@ function roomState(room) {
     players,
     submittedCount: players.filter((p) => p.submitted && p.alive).length,
     confirmedCount: players.filter((p) => p.confirmed && p.alive).length,
+    confirmedSubmitCount: players.filter((p) => p.confirmedSubmit && p.alive).length,
+    votedCount: players.filter((p) => p.votedEnd && p.alive).length,
     initialWords: room.initialWords,
     lastWords: room.lastWords,
     ended: room.phase === 'ended',
@@ -98,31 +103,50 @@ function startRound(room) {
   room.phase = 'round';
   room.submissions = {};
   const secs = room.round === 1 ? room.tFirst : room.tNext;
-  room.deadline = Date.now() + secs * 1000;
+  room.roundStartAt = Date.now();
+  room.deadline = room.roundStartAt + secs * 1000;
+  for (const p of room.players.values()) {
+    p.confirmed = false;
+    p.confirmedSubmit = false;
+    p.confirmedAt = null;
+    p.votedEnd = false;
+  }
   for (const p of alivePlayers(room)) p.inRound = true;
   room.timer = setTimeout(() => endRound(room), secs * 1000);
   pushState(room);
+}
+
+// 速度积分：前 20 秒满分 20，之后线性下降到倒计时结束的 10 分
+function speedScore(t, T) {
+  const secs = Math.max(0, Math.min(t, T));
+  if (secs <= 20 || T <= 20) return 20;
+  return Math.max(10, Math.round(20 - (10 * (secs - 20)) / (T - 20)));
 }
 
 function endRound(room) {
   clearTimer(room);
   room.phase = 'reveal';
   const roundPlayers = alivePlayers(room).filter((p) => p.inRound);
+  const T = Math.max(1, (room.deadline - room.roundStartAt) / 1000);
+  // 倒计时结束：还没确认提交的玩家视为压线自动提交
+  for (const p of roundPlayers) {
+    if (!p.confirmedSubmit) p.confirmedAt = room.deadline;
+  }
   const words = roundPlayers.map((p) => ({ name: p.name, word: room.submissions[p.id] || null }));
   room.lastWords = words;
   room.history.push({ round: room.round, words });
   const submitted = words.filter((w) => w.word);
 
-  // 本轮同步奖励：与至少一名其他人的词相同，+10；词与众不同的不得分
-  if (submitted.length >= 2) {
-    const counts = new Map();
-    for (const w of submitted) counts.set(norm(w.word), (counts.get(norm(w.word)) || 0) + 1);
-    for (const p of roundPlayers) {
-      const w = room.submissions[p.id];
-      if (w && counts.get(norm(w)) >= 2) {
-        p.score += 10;
-        p.matched += 1;
-      }
+  const counts = new Map();
+  for (const w of submitted) counts.set(norm(w.word), (counts.get(norm(w.word)) || 0) + 1);
+  const speedOf = (p) => speedScore((p.confirmedAt - room.roundStartAt) / 1000, T);
+
+  // 同步奖励：与至少一名其他人词相同的玩家，按提交速度得分（最快 20，压线保底 10）
+  for (const p of roundPlayers) {
+    const w = room.submissions[p.id];
+    if (w && counts.get(norm(w)) >= 2) {
+      p.score += speedOf(p);
+      p.matched += 1;
     }
   }
 
@@ -134,25 +158,38 @@ function endRound(room) {
   if (converged) {
     room.phase = 'ended';
     room.endReason = 'win';
-    const r = room.round;
-    const win = 50;
-    const speed = Math.max(0, 10 - r) * 10;
-    for (const p of roundPlayers) p.score += win + speed;
     room.lastScores = roundPlayers.map((p) => ({
-      name: p.name, match: p.matched * 10, win, speed, total: p.score, word: submitted[0].word,
+      name: p.name, speed: speedOf(p), total: p.score, word: submitted[0].word,
     }));
   } else if (submitted.length === 0) {
     // 无人提交：游戏自动结束
     room.phase = 'ended';
     room.endReason = 'nobody';
-    room.lastScores = roundPlayers.map((p) => ({
-      name: p.name, match: p.matched * 10, win: 0, speed: 0, total: p.score, word: null,
-    }));
+    room.lastScores = null;
   } else {
     // 公示阶段：等所有存活玩家确认后再进入下一轮
-    for (const q of alivePlayers(room)) q.confirmed = false;
+    for (const q of alivePlayers(room)) {
+      q.confirmed = false;
+      q.votedEnd = false;
+    }
   }
   pushState(room);
+}
+
+function endByVote(room) {
+  room.phase = 'ended';
+  room.endReason = 'vote';
+  for (const p of alivePlayers(room)) p.score += 20;
+  room.lastScores = alivePlayers(room).map((p) => ({
+    name: p.name, vote: 20, total: p.score, word: null,
+  }));
+  pushState(room);
+}
+
+function checkAllVoted(room) {
+  if (room.phase !== 'reveal') return;
+  const alive = alivePlayers(room);
+  if (alive.length > 0 && alive.every((q) => q.votedEnd)) endByVote(room);
 }
 
 function checkAllConfirm(room) {
@@ -180,10 +217,41 @@ function rematch(room) {
     p.score = 0;
     p.matched = 0;
     p.confirmed = false;
+    p.inRound = false;
+    p.confirmedSubmit = false;
+    p.confirmedAt = null;
+    p.votedEnd = false;
   }
   room.phase = 'initial';
   room.round = 0;
   room.deadline = 0;
+  room.roundStartAt = 0;
+  room.submissions = {};
+  room.initialWords = null;
+  room.lastWords = null;
+  room.lastScores = null;
+  room.endReason = null;
+  room.history = [];
+  pushState(room);
+}
+
+// 房主随时重新开始：所有人回到大厅，积分清零
+function restart(room) {
+  clearTimer(room);
+  for (const [id, p] of [...room.players]) if (!p.alive) room.players.delete(id);
+  for (const p of room.players.values()) {
+    p.score = 0;
+    p.matched = 0;
+    p.confirmed = false;
+    p.inRound = false;
+    p.confirmedSubmit = false;
+    p.confirmedAt = null;
+    p.votedEnd = false;
+  }
+  room.phase = 'lobby';
+  room.round = 0;
+  room.deadline = 0;
+  room.roundStartAt = 0;
   room.submissions = {};
   room.initialWords = null;
   room.lastWords = null;
@@ -211,6 +279,7 @@ function detach(ws) {
           checkAllInitialSubmitted(room);
         } else if (room.phase === 'reveal') {
           checkAllConfirm(room);
+          checkAllVoted(room);
         }
         pushState(room);
         return;
@@ -235,7 +304,7 @@ wss.on('connection', (ws) => {
       detach(ws);
       const room = createRoom();
       rooms.set(room.code, room);
-      const player = { id: genId(), name, ws, alive: true, score: 0, matched: 0, inRound: false, confirmed: false, room };
+      const player = { id: genId(), name, ws, alive: true, score: 0, matched: 0, inRound: false, confirmed: false, confirmedSubmit: false, confirmedAt: null, votedEnd: false, room };
       room.players.set(player.id, player);
       room.host = player.id;
       send(ws, { type: 'joined', code: room.code, playerId: player.id });
@@ -260,10 +329,13 @@ wss.on('connection', (ws) => {
         existing.ws = ws;
         existing.alive = true;
         send(ws, { type: 'joined', code: room.code, playerId: existing.id });
+        if (room.phase === 'round' && existing.id in room.submissions) {
+          send(ws, { type: 'myWord', word: room.submissions[existing.id] });
+        }
         pushState(room);
         return;
       }
-      const player = { id: genId(), name, ws, alive: true, score: 0, matched: 0, inRound: false, confirmed: false, room };
+      const player = { id: genId(), name, ws, alive: true, score: 0, matched: 0, inRound: false, confirmed: false, confirmedSubmit: false, confirmedAt: null, votedEnd: false, room };
       room.players.set(player.id, player);
       send(ws, { type: 'joined', code: room.code, playerId: player.id });
       pushState(room);
@@ -276,8 +348,8 @@ wss.on('connection', (ws) => {
 
     if (msg.type === 'start') {
       if (room.phase !== 'lobby' || p.id !== room.host) return;
-      room.tFirst = Math.min(600, Math.max(5, Number(msg.tFirst) || 60));
-      room.tNext = Math.min(600, Math.max(5, Number(msg.tNext) || 60));
+      room.tFirst = Math.min(180, Math.max(20, Number(msg.tFirst) || 60));
+      room.tNext = Math.min(180, Math.max(20, Number(msg.tNext) || 60));
       room.phase = 'initial';
       room.round = 0;
       room.submissions = {};
@@ -307,7 +379,7 @@ wss.on('connection', (ws) => {
       if (room.phase !== 'initial' && room.phase !== 'round') return;
       if (room.phase === 'round') {
         if (!p.inRound) return send(ws, { type: 'error', message: '本轮你未参与，下一轮再提交' });
-        if (p.id in room.submissions) return send(ws, { type: 'error', message: '本轮已提交，等待其他玩家' });
+        if (p.id in room.submissions) return send(ws, { type: 'error', message: '本轮已提交' });
       }
       const word = String(msg.word || '').trim().slice(0, 50);
       if (!word) return;
@@ -318,15 +390,24 @@ wss.on('connection', (ws) => {
         checkAllInitialSubmitted(room);
         return;
       }
-      // 全员提交后立即公示
-      const allIn = alivePlayers(room).filter((q) => q.inRound).every((q) => q.id in room.submissions);
-      if (allIn) endRound(room);
+      send(ws, { type: 'myWord', word });
+      pushState(room);
+      return;
+    }
+
+    if (msg.type === 'confirmSubmit') {
+      if (room.phase !== 'round' || !p.inRound || p.confirmedSubmit) return;
+      if (!(p.id in room.submissions)) return;
+      p.confirmedSubmit = true;
+      p.confirmedAt = Date.now();
+      const inRound = alivePlayers(room).filter((q) => q.inRound);
+      if (inRound.every((q) => q.confirmedSubmit)) endRound(room);
       else pushState(room);
       return;
     }
 
     if (msg.type === 'unsubmit') {
-      if (room.phase !== 'round' || !(p.id in room.submissions)) return;
+      if (room.phase !== 'round' || !(p.id in room.submissions) || p.confirmedSubmit) return;
       delete room.submissions[p.id];
       pushState(room);
       return;
@@ -337,6 +418,20 @@ wss.on('connection', (ws) => {
       p.confirmed = true;
       pushState(room);
       checkAllConfirm(room);
+      return;
+    }
+
+    if (msg.type === 'voteEnd') {
+      if (room.phase !== 'reveal' || p.votedEnd) return;
+      p.votedEnd = true;
+      pushState(room);
+      checkAllVoted(room);
+      return;
+    }
+
+    if (msg.type === 'restart') {
+      if (p.id !== room.host) return;
+      restart(room);
       return;
     }
 
